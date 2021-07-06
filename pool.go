@@ -1,6 +1,7 @@
 package goworker
 
 import (
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -17,7 +18,8 @@ type Pool struct {
 	tidCounter uint64
 	widCounter uint64
 
-	taskQueue *unlock.RingBuffer
+	taskQueue      *unlock.RingBuffer
+	workerDataPool sync.Pool
 
 	HandlerFunc func(Task)
 }
@@ -48,6 +50,10 @@ func NewPool(maxWorkers int, taskQueueSize int) *Pool {
 		maxWorkers:    maxWorkers,
 		taskQueueSize: taskQueueSize,
 		taskQueue:     unlock.NewRingBuffer(taskQueueSize),
+		// Performance optimization by sync.Pool
+		workerDataPool: sync.Pool{New: func() interface{} {
+			return new(workerData)
+		}},
 	}
 	return pool
 }
@@ -56,18 +62,18 @@ func (p *Pool) RunTask(data unsafe.Pointer) {
 	if atomic.LoadInt64(&p.idle) == 0 && int(atomic.LoadInt64(&p.workers)) < p.maxWorkers {
 		go p.worker()
 	}
-	p.taskQueue.EnQueue(unsafe.Pointer(&workerData{
-		CommandType: RunHandler,
-		Data:        data,
-	}))
+	wd := p.workerDataPool.Get().(*workerData)
+	wd.CommandType = RunHandler
+	wd.Data = data
+	p.taskQueue.EnQueue(unsafe.Pointer(wd))
 }
 
 // StopWorker stops the one worker
 func (p *Pool) StopWorker() {
-	p.taskQueue.EnQueue(unsafe.Pointer(&workerData{
-		CommandType: Stop,
-		Data:        nil,
-	}))
+	wd := p.workerDataPool.Get().(*workerData)
+	wd.CommandType = Stop
+	wd.Data = nil
+	p.taskQueue.EnQueue(unsafe.Pointer(wd))
 }
 
 func (p *Pool) worker() {
@@ -77,6 +83,7 @@ func (p *Pool) worker() {
 	defer atomic.AddInt64(&p.workers, -1)
 	for {
 		wd := (*workerData)(p.taskQueue.DeQueue())
+		defer p.workerDataPool.Put(wd)
 		atomic.AddInt64(&p.idle, -1)
 		TaskID := atomic.AddUint64(&p.tidCounter, 1)
 		switch wd.CommandType {
